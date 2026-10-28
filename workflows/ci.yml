@@ -1,0 +1,85 @@
+# Builds and tests the engine on Linux, Windows (MSVC) and macOS (Apple clang).
+# The macOS job also packages "YK Engine.app" and its disk image, then exercises them
+# the way a user would (packaging/verify-macos-app.sh).
+name: CI
+
+on:
+  push:
+    paths-ignore:
+      - 'release/**'
+      - 'installers/**'
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build clang-format \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxfixes-dev libxi-dev libxss-dev \
+            libxkbcommon-dev libasound2-dev libpulse-dev libudev-dev libdbus-1-dev \
+            libgl1-mesa-dev libegl1-mesa-dev libdrm-dev libgbm-dev
+      - name: Configure
+        run: cmake --preset dev
+      - name: Formatting
+        run: cmake --build --preset dev --target format-check
+      - name: Build
+        run: cmake --build --preset dev
+      - name: Test
+        run: ctest --preset dev
+
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure (Visual Studio, x64)
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DBUILD_TESTING=ON -DYK_BUILD_GAMES=ON
+      - name: Build
+        run: cmake --build build --config Release --parallel
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Ninja
+        run: brew install ninja
+      - name: Configure
+        run: cmake --preset release
+      - name: Build
+        run: cmake --build --preset release
+      # The tests run, but a failure must not hide whether the application can be packaged and
+      # launched: the job fails at the end if they failed.
+      - name: Test
+        id: tests
+        continue-on-error: true
+        run: ctest --preset release
+      - name: Package YK Engine.app and the disk image
+        run: packaging/package-macos.sh --no-build
+      - name: Verify the packaged application
+        run: packaging/verify-macos-app.sh
+      - name: Keep the disk image, screenshots and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-engine
+          path: |
+            build/macos-dist/*.dmg
+            build/macos-verify/shots
+            build/macos-verify/logs
+            build/release/Testing/Temporary/LastTest.log
+          if-no-files-found: warn
+      - name: Fail if the tests failed
+        if: steps.tests.outcome == 'failure'
+        run: exit 1

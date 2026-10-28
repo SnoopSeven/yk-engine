@@ -1,0 +1,198 @@
+name: Release apps and installers
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'release/**'
+      - 'installers/**'
+  workflow_dispatch:
+
+concurrency:
+  group: release-main
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Assign a unique version to this push
+        id: version
+        run: |
+          base=$(sed -n 's/^set(YK_RELEASE_VERSION "\([0-9.]*\)".*/\1/p' CMakeLists.txt)
+          test -n "$base"
+          IFS=. read -r major minor patch <<< "$base"
+          echo "version=$major.$minor.$((patch + GITHUB_RUN_NUMBER))" >> "$GITHUB_OUTPUT"
+
+  windows:
+    needs: prepare
+    runs-on: windows-2022
+    env:
+      RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check updater syntax
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path 'packaging/update/windows.ps1'), [ref]$tokens, [ref]$errors) | Out-Null
+          if ($errors.Count) { throw ($errors | Out-String) }
+          & tests/update/windows-mock.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'Windows updater mock test failed' }
+      - name: Install NSIS on the build runner
+        shell: pwsh
+        run: |
+          choco install nsis --yes --no-progress
+          $nsis = Join-Path ${env:ProgramFiles(x86)} 'NSIS'
+          if (!(Test-Path (Join-Path $nsis 'makensis.exe'))) { throw 'NSIS was not installed' }
+          $nsis | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      - name: Configure with a static C++ runtime
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DBUILD_TESTING=ON -DYK_BUILD_GAMES=ON -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded "-DYK_RELEASE_VERSION=$env:RELEASE_VERSION"
+      - name: Build
+        run: cmake --build build --config Release --parallel
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+      - name: Build Windows setup wizard
+        shell: pwsh
+        run: |
+          cpack --config build/CPackConfig.cmake -C Release -G NSIS -B build/windows-dist
+          if ($LASTEXITCODE -ne 0) { throw 'CPack NSIS failed' }
+          $installer = Get-ChildItem build/windows-dist/YKEngine-*-windows-x64.exe
+          if (@($installer).Count -ne 1) { throw 'Expected one Windows installer' }
+          $installPath = Join-Path $env:RUNNER_TEMP 'YKEngineInstallerSmoke'
+          $process = Start-Process -FilePath $installer.FullName -ArgumentList @('/S', "/D=$installPath") -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw 'Windows installer failed' }
+          $installRoots = @($installPath, (Join-Path $env:ProgramFiles 'YK Engine'),
+            (Join-Path ${env:ProgramFiles(x86)} 'YK Engine'))
+          $actualRoot = $installRoots | Where-Object {
+            Test-Path (Join-Path $_ 'bin/yk_editor.exe')
+          } | Select-Object -First 1
+          if (!$actualRoot) {
+            foreach ($root in $installRoots) {
+              if (Test-Path $root) { Get-ChildItem $root -Recurse | Select-Object -First 40 FullName }
+            }
+            throw 'Windows installer did not create the editor in an expected location'
+          }
+          foreach ($name in 'yk_editor.exe', 'yk_player.exe', 'yk.exe') {
+            if (!(Test-Path (Join-Path $actualRoot "bin/$name"))) { throw "Installer omitted $name" }
+          }
+          if (Test-Path (Join-Path $actualRoot 'share/yk-engine/games')) {
+            throw 'Engine installer must not contain demo games'
+          }
+          & cmake "-DEDITOR=$actualRoot/bin/yk_editor.exe" `
+            "-DSCRIPT=$pwd/tests/install/blank_engine.ykscript" `
+            "-DWORK=$env:RUNNER_TEMP/blank-engine" -P tests/editor/run_script.cmake
+          if ($LASTEXITCODE -ne 0) { throw 'Blank installed engine failed' }
+          Get-FileHash $installer.FullName -Algorithm SHA256 | Format-List
+      - name: Build and verify separate demo game installers
+        shell: pwsh
+        run: |
+          python packaging/package-demos.py --build-dir build --out build/windows-dist --version "$env:RELEASE_VERSION"
+          if ($LASTEXITCODE -ne 0) { throw 'Demo packaging failed' }
+          & packaging/verify-demo-installers.ps1 -Dist build/windows-dist
+      - name: Package runnable Windows apps
+        shell: pwsh
+        run: |
+          cmake --install build --config Release --prefix build/portable-engine
+          if ($LASTEXITCODE -ne 0) { throw 'Portable engine installation failed' }
+          # Collect this build into fresh output folders, without mixing checked-in releases.
+          Remove-Item release, installers -Recurse -Force
+          python packaging/package-apps.py --platform windows-x64 --version "$env:RELEASE_VERSION" `
+            --engine build/portable-engine `
+            --invisible-castle "build/windows-dist/work/invisible-castle/Invisible-Castle-windows" `
+            --brothers-run "build/windows-dist/work/brothers-run/Brothers-Run-windows" `
+            --installers build/windows-dist
+          if ($LASTEXITCODE -ne 0) { throw 'Portable app packaging failed' }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-release
+          path: |
+            release/downloads/*.zip
+            installers/windows-x64/*.exe
+          if-no-files-found: error
+
+  macos:
+    needs: prepare
+    runs-on: macos-14
+    env:
+      RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check updater syntax
+        run: bash -n packaging/update/macos.sh
+      - name: Install Ninja on the build runner
+        run: brew install ninja
+      - name: Configure
+        run: cmake --preset release -DYK_WARNINGS_AS_ERRORS=OFF -DYK_RELEASE_VERSION="$RELEASE_VERSION"
+      - name: Build
+        run: cmake --build --preset release
+      - name: Test
+        run: ctest --preset release
+      - name: Build macOS installers
+        run: packaging/package-macos.sh --no-build
+      - name: Build separate demo game installers
+        run: python3 packaging/package-demos.py --build-dir build/release --out build/macos-dist --version "$RELEASE_VERSION"
+      - name: Verify the packaged application and installers
+        run: packaging/verify-macos-app.sh
+      - name: Package runnable macOS apps
+        run: |
+          # Collect this build into fresh output folders, without mixing checked-in releases.
+          rm -rf release installers
+          python3 packaging/package-apps.py --platform macos-arm64 --version "$RELEASE_VERSION" \
+            --engine "build/macos-dist/YK Engine.app" \
+            --invisible-castle "build/macos-dist/work/invisible-castle/Invisible Castle.app" \
+            --brothers-run "build/macos-dist/work/brothers-run/Brothers Run.app" \
+            --installers build/macos-dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-release
+          path: |
+            release/downloads/*.zip
+            installers/macos-arm64/*.dmg
+            installers/macos-arm64/*.pkg
+          if-no-files-found: error
+
+  publish:
+    needs: [prepare, windows, macos]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: '*-release'
+          path: release-assets
+          merge-multiple: true
+      - name: Publish only after both platform checks pass
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir downloads
+          find release-assets -type f \( -name '*.exe' -o -name '*.dmg' -o -name '*.pkg' -o -name '*.zip' \) -exec cp {} downloads/ \;
+          test "$(find downloads -maxdepth 1 -name '*.exe' | wc -l)" -eq 3
+          test "$(find downloads -maxdepth 1 -name '*.dmg' | wc -l)" -eq 3
+          test "$(find downloads -maxdepth 1 -name '*.pkg' | wc -l)" -eq 3
+          test "$(find downloads -maxdepth 1 -name '*.zip' | wc -l)" -eq 6
+          (cd downloads && sha256sum *.exe *.dmg *.pkg *.zip > SHA256SUMS.txt)
+          python3 packaging/release-notes.py "$RELEASE_VERSION" > downloads/RELEASE_NOTES.md
+          tag="v$RELEASE_VERSION"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" downloads/*.exe downloads/*.dmg downloads/*.pkg downloads/*.zip downloads/SHA256SUMS.txt --clobber
+          else
+            gh release create "$tag" downloads/*.exe downloads/*.dmg downloads/*.pkg downloads/*.zip downloads/SHA256SUMS.txt --target "$GITHUB_SHA" --title "YK Engine $RELEASE_VERSION" \
+              --notes-file downloads/RELEASE_NOTES.md --draft
+          fi
+          gh release edit "$tag" --notes-file downloads/RELEASE_NOTES.md --draft=false --latest
+          python3 packaging/label-release-assets.py "$tag"

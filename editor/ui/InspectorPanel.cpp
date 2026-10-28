@@ -1,0 +1,949 @@
+#include "ui/Panels.hpp"
+#include "yk/core/Log.hpp"
+#include <algorithm>
+#include <cctype>
+#include <cfloat>
+#include <cmath>
+#include <cstring>
+#include <set>
+
+namespace yk::editor::ui {
+namespace {
+struct Inspect {
+    EditorState &state;
+    const Scene &scene;
+    EditorDocument *doc; // Null while playing: the panel is read-only.
+    EntityId entity;
+};
+
+struct PropertyView {
+    Inspect &inspect;
+    std::size_t componentIndex;
+    const PropertyInfo &property;
+    std::string changeLabel;
+};
+
+// Writes `value` into the property being edited (inside the change commitEdit opened). With
+// several entities selected the same value goes into the same component (the n-th of its type) of
+// every selected entity that has one, so a row of tiles can be recolored or reordered at once.
+void write(const PropertyView &view, PropertyValue value) {
+    EditorDocument &doc = *view.inspect.doc;
+    Scene &scene = doc.edit();
+    Entity *primary = scene.find(view.inspect.entity);
+    if (!primary || view.componentIndex >= primary->components().size())
+        return;
+    const std::string typeName = primary->components()[view.componentIndex]->type().name;
+    int occurrence = 0;
+    for (std::size_t i = 0; i < view.componentIndex; ++i)
+        occurrence += primary->components()[i]->type().name == typeName ? 1 : 0;
+    const auto assignTo = [&](Entity &entity) {
+        int seen = 0;
+        for (const auto &component : entity.components())
+            if (component->type().name == typeName && seen++ == occurrence) {
+                view.property.assign(*component, value);
+                return;
+            }
+    };
+    assignTo(*primary);
+    if (doc.isSelected(view.inspect.entity))
+        for (const EntityId id : doc.selection())
+            if (id != view.inspect.entity)
+                if (Entity *other = scene.find(id))
+                    assignTo(*other);
+}
+
+// One-shot edit for widgets that change discretely (a list item removed, an entity picked).
+void writeOnce(const PropertyView &view, PropertyValue value) {
+    view.inspect.doc->change(view.changeLabel, [&](Scene &) { write(view, std::move(value)); });
+}
+
+bool containsInsensitive(const std::string &text, const std::string &needle) {
+    if (needle.empty())
+        return true;
+    return std::search(text.begin(), text.end(), needle.begin(), needle.end(), [](char a, char b) {
+               return std::tolower(static_cast<unsigned char>(a)) ==
+                      std::tolower(static_cast<unsigned char>(b));
+           }) != text.end();
+}
+
+// A searchable list of the scene's entities. Returns the chosen id (or the null id for "None").
+std::optional<EntityId> entityPicker(const Inspect &inspect, const char *popupId,
+                                     EntityId exclude) {
+    std::optional<EntityId> chosen;
+    if (!ImGui::BeginPopup(popupId))
+        return chosen;
+    static std::string filter;
+    if (ImGui::IsWindowAppearing()) {
+        filter.clear();
+        ImGui::SetKeyboardFocusHere();
+    }
+    inputText("##filter", filter, 0, "Search entities");
+    ImGui::BeginChild("##list", {260.0F, 220.0F}, ImGuiChildFlags_Borders);
+    if (ImGui::Selectable("(None)"))
+        chosen = EntityId{};
+    for (const EntityId id : inspect.scene.hierarchyOrder()) {
+        if (id == exclude)
+            continue;
+        const Entity *candidate = inspect.scene.find(id);
+        if (!containsInsensitive(candidate->name(), filter))
+            continue;
+        ImGui::PushID(reinterpret_cast<const void *>(static_cast<std::uintptr_t>(id.value)));
+        // Indent by depth so duplicate names stay distinguishable.
+        int depth = 0;
+        for (const Entity *up = candidate->parent(); up; up = up->parent())
+            ++depth;
+        ImGui::Indent(static_cast<float>(depth) * 8.0F);
+        const bool picked = ImGui::Selectable(entityLabel(inspect.scene, id).c_str());
+        markItem("picker/" + candidate->name());
+        if (picked)
+            chosen = id;
+        ImGui::Unindent(static_cast<float>(depth) * 8.0F);
+        ImGui::PopID();
+    }
+    ImGui::EndChild();
+    if (chosen)
+        ImGui::CloseCurrentPopup();
+    ImGui::EndPopup();
+    return chosen;
+}
+
+void startPick(const PropertyView &view, std::function<void(EntityId)> onPick) {
+    view.inspect.state.pick = PickRequest{"Click an entity in the Scene view to assign '" +
+                                              label(view.property.name) + "'  (Esc cancels)",
+                                          std::move(onPick)};
+}
+
+// Accepts an entity dragged from the hierarchy onto the last item.
+std::optional<EntityId> droppedEntity() {
+    std::optional<EntityId> dropped;
+    if (ImGui::BeginDragDropTarget()) {
+        if (const ImGuiPayload *payload = ImGui::AcceptDragDropPayload("YK_ENTITY")) {
+            EntityId id;
+            std::memcpy(&id, payload->Data, sizeof id);
+            dropped = id;
+        }
+        ImGui::EndDragDropTarget();
+    }
+    return dropped;
+}
+
+void entityField(const PropertyView &view, EntityId current) {
+    const Inspect &inspect = view.inspect;
+    const float button = ImGui::GetFrameHeight();
+    const float spacing = ImGui::GetStyle().ItemSpacing.x;
+    const float nameWidth = ImGui::GetContentRegionAvail().x - 2.0F * (button + spacing);
+    const Entity *target = current ? inspect.scene.find(current) : nullptr;
+    const std::string text = !current ? "None"
+                             : target ? entityLabel(inspect.scene, current)
+                                      : "(missing)";
+    ImGui::PushStyleColor(ImGuiCol_Text, imColor(!current ? palette::dim
+                                                 : target ? Color{216, 220, 230, 255}
+                                                          : palette::error));
+    const bool clicked =
+        ImGui::Button((text + "##target").c_str(), {std::max(20.0F, nameWidth), 0.0F});
+    ImGui::PopStyleColor();
+    markItem("prop/" + view.property.name);
+    tooltip(current ? "Click to choose another entity. Ctrl+click selects it."
+                    : "Click to choose an entity, or drop one here.");
+    if (clicked) {
+        if (ImGui::GetIO().KeyCtrl && target)
+            inspect.state.inspect(current);
+        else if (inspect.doc)
+            ImGui::OpenPopup("entity_picker");
+    }
+    if (inspect.doc) {
+        if (const auto dropped = droppedEntity())
+            writeOnce(view, *dropped);
+        if (const auto picked = entityPicker(inspect, "entity_picker", inspect.entity))
+            writeOnce(view, *picked);
+    }
+    ImGui::SameLine();
+    if (iconButton(("prop/" + view.property.name + "/pick").c_str(), Icon::Target, false,
+                   "Pick an entity in the Scene view", 0, button))
+        startPick(view,
+                  [state = &inspect.state, entity = inspect.entity, component = view.componentIndex,
+                   property = view.property.name](EntityId id) {
+                      if (state->document && !state->playing())
+                          state->document->setProperty(entity, component, property, id);
+                  });
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!current);
+    if (iconButton(("prop/" + view.property.name + "/clear").c_str(), Icon::Cross, false, "Clear",
+                   0, button))
+        writeOnce(view, EntityId{});
+    ImGui::EndDisabled();
+}
+
+void entityListField(const PropertyView &view, const std::vector<EntityId> &list) {
+    const Inspect &inspect = view.inspect;
+    std::optional<std::size_t> removeAt;
+    for (std::size_t i = 0; i < list.size(); ++i) {
+        ImGui::PushID(static_cast<int>(i));
+        const Entity *target = inspect.scene.find(list[i]);
+        const float button = ImGui::GetFrameHeight();
+        ImGui::PushStyleColor(ImGuiCol_Text,
+                              imColor(target ? Color{216, 220, 230, 255} : palette::error));
+        if (ImGui::Button((entityLabel(inspect.scene, list[i]) + "##item").c_str(),
+                          {std::max(20.0F, ImGui::GetContentRegionAvail().x - button -
+                                               ImGui::GetStyle().ItemSpacing.x),
+                           0.0F}) &&
+            target)
+            inspect.state.inspect(list[i]);
+        ImGui::PopStyleColor();
+        markItem("prop/" + view.property.name + "/" + entityLabel(inspect.scene, list[i]));
+        tooltip("Click to select this entity.");
+        ImGui::SameLine();
+        if (iconButton(("prop/" + view.property.name + "/remove/" + std::to_string(i)).c_str(),
+                       Icon::Cross, false, "Remove from the list", 0, button))
+            removeAt = i;
+        ImGui::PopID();
+    }
+    const float button = ImGui::GetFrameHeight();
+    const bool add = ImGui::Button(
+        "+ Add",
+        {ImGui::GetContentRegionAvail().x - button - ImGui::GetStyle().ItemSpacing.x, 0.0F});
+    markItem("prop/" + view.property.name + "/add");
+    tooltip("Choose an entity to add, or drop one here.");
+    if (add && inspect.doc)
+        ImGui::OpenPopup("entity_picker");
+    // An entity dragged from the hierarchy can be dropped on the Add button.
+    const std::optional<EntityId> dropped = inspect.doc ? droppedEntity() : std::nullopt;
+    ImGui::SameLine();
+    if (iconButton(("prop/" + view.property.name + "/pick").c_str(), Icon::Target, false,
+                   "Pick entities in the Scene view", 0, button)) {
+        startPick(view, [state = &inspect.state, entity = inspect.entity,
+                         component = view.componentIndex,
+                         property = view.property.name](EntityId id) {
+            if (!state->document || state->playing())
+                return;
+            // Read the list when the click happens, not when the button was pressed.
+            const Entity *owner = state->document->scene().find(entity);
+            if (!owner || component >= owner->components().size())
+                return;
+            const Component &target = *owner->components()[component];
+            const PropertyInfo *info = target.type().find(property);
+            if (!info)
+                return;
+            std::vector<EntityId> extended = std::get<std::vector<EntityId>>(info->get(target));
+            if (std::find(extended.begin(), extended.end(), id) == extended.end())
+                extended.push_back(id);
+            state->document->setProperty(entity, component, property, extended);
+        });
+    }
+    if (inspect.doc) {
+        std::vector<EntityId> updated = list;
+        bool changed = false;
+        if (dropped && std::find(updated.begin(), updated.end(), *dropped) == updated.end()) {
+            updated.push_back(*dropped);
+            changed = true;
+        }
+        if (const auto picked = entityPicker(inspect, "entity_picker", inspect.entity)) {
+            if (*picked && std::find(updated.begin(), updated.end(), *picked) == updated.end()) {
+                updated.push_back(*picked);
+                changed = true;
+            }
+        }
+        if (removeAt) {
+            updated.erase(updated.begin() + static_cast<std::ptrdiff_t>(*removeAt));
+            changed = true;
+        }
+        if (changed)
+            writeOnce(view, updated);
+    }
+}
+
+void stringListField(const PropertyView &view, const std::vector<std::string> &list) {
+    const Inspect &inspect = view.inspect;
+    std::vector<std::string> updated = list;
+    std::optional<std::size_t> removeAt;
+    const float button = ImGui::GetFrameHeight();
+    for (std::size_t i = 0; i < updated.size(); ++i) {
+        ImGui::PushID(static_cast<int>(i));
+        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - button -
+                                ImGui::GetStyle().ItemSpacing.x);
+        const bool changed = inputText("##item", updated[i]);
+        markItem("prop/" + view.property.name + "/" + std::to_string(i));
+        if (inspect.doc)
+            commitEdit(*inspect.doc, view.changeLabel, changed, [&] { write(view, updated); });
+        ImGui::SameLine();
+        if (iconButton(("prop/" + view.property.name + "/remove/" + std::to_string(i)).c_str(),
+                       Icon::Cross, false, "Remove", 0, button))
+            removeAt = i;
+        ImGui::PopID();
+    }
+    // Tags already used in the scene, offered as quick additions.
+    std::set<std::string> known;
+    inspect.scene.forEach([&](const Entity &entity) {
+        for (const std::string &tag : entity.tags())
+            known.insert(tag);
+    });
+    const bool add = ImGui::Button(
+        "+ Add",
+        {ImGui::GetContentRegionAvail().x - button - ImGui::GetStyle().ItemSpacing.x, 0.0F});
+    markItem("prop/" + view.property.name + "/add");
+    ImGui::SameLine();
+    const bool browse = iconButton(("prop/" + view.property.name + "/known").c_str(), Icon::Search,
+                                   false, "Choose from tags used in this scene", 0, button);
+    if (browse && !known.empty())
+        ImGui::OpenPopup("known_tags");
+    bool changed = false;
+    if (add) {
+        updated.emplace_back();
+        changed = true;
+    }
+    if (ImGui::BeginPopup("known_tags")) {
+        for (const std::string &tag : known)
+            if (ImGui::Selectable(tag.c_str())) {
+                updated.push_back(tag);
+                changed = true;
+            }
+        ImGui::EndPopup();
+    }
+    if (removeAt) {
+        updated.erase(updated.begin() + static_cast<std::ptrdiff_t>(*removeAt));
+        changed = true;
+    }
+    if (changed && inspect.doc)
+        writeOnce(view, updated);
+}
+
+bool assetExists(const EditorState &state, const std::string &path) {
+    if (path.empty() || path.starts_with("builtin:") || path.starts_with("tone:"))
+        return true;
+    if (!state.project)
+        return false;
+    const auto absolute = state.project->project().resolve(path);
+    std::error_code error;
+    return absolute && std::filesystem::exists(absolute.value(), error);
+}
+
+void assetField(const PropertyView &view, const AssetRef &current) {
+    EditorState &state = view.inspect.state;
+    const float button = ImGui::GetFrameHeight();
+    const float spacing = ImGui::GetStyle().ItemSpacing.x;
+    std::string path = current.path;
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 2.0F * (button + spacing));
+    const bool missing = !assetExists(state, path);
+    if (missing)
+        ImGui::PushStyleColor(ImGuiCol_Text, imColor(palette::error));
+    const bool changed =
+        inputText("##asset", path, 0,
+                  view.property.assetKind.empty() ? "path" : view.property.assetKind.c_str());
+    if (missing)
+        ImGui::PopStyleColor();
+    markItem("prop/" + view.property.name);
+    tooltip(missing ? "This file does not exist in the project."
+                    : "Project-relative path, or a built-in placeholder.");
+    if (view.inspect.doc)
+        commitEdit(*view.inspect.doc, view.changeLabel, changed,
+                   [&] { write(view, AssetRef{path}); });
+    ImGui::SameLine();
+    if (iconButton(("prop/" + view.property.name + "/browse").c_str(), Icon::Folder, false,
+                   "Choose an asset", 0, button))
+        ImGui::OpenPopup("asset_picker");
+    ImGui::SameLine();
+    ImGui::BeginDisabled(current.path.empty());
+    if (iconButton(("prop/" + view.property.name + "/clear").c_str(), Icon::Cross, false, "Clear",
+                   0, button) &&
+        view.inspect.doc)
+        writeOnce(view, AssetRef{});
+    ImGui::EndDisabled();
+    if (ImGui::BeginPopup("asset_picker")) {
+        const std::string &kind = view.property.assetKind;
+        std::optional<std::string> chosen;
+        if (kind == "texture") {
+            if (ImGui::Selectable("builtin:white"))
+                chosen = "builtin:white";
+            if (ImGui::Selectable("builtin:circle"))
+                chosen = "builtin:circle";
+        } else if (kind == "sound") {
+            struct Preset {
+                const char *name;
+                const char *tone;
+            };
+            for (const Preset &preset : {Preset{"Beep (placeholder)", "tone:660,0.12"},
+                                         Preset{"Low beep (placeholder)", "tone:220,0.18,square"},
+                                         Preset{"Chime (placeholder)", "tone:880,0.25"},
+                                         Preset{"Noise burst (placeholder)", "tone:200,0.2,noise"}})
+                if (ImGui::Selectable(preset.name))
+                    chosen = preset.tone;
+        }
+        AssetKind wanted = AssetKind::Other;
+        if (kind == "texture")
+            wanted = AssetKind::Texture;
+        else if (kind == "sound")
+            wanted = AssetKind::Sound;
+        else if (kind == "prefab")
+            wanted = AssetKind::Prefab;
+        else if (kind == "animation")
+            wanted = AssetKind::Animation;
+        else if (kind == "scene")
+            wanted = AssetKind::Scene;
+        else if (kind == "dialogue")
+            wanted = AssetKind::Dialogue;
+        if (state.project) {
+            bool any = false;
+            for (const AssetEntry &entry : state.project->files())
+                if (entry.kind == wanted && wanted != AssetKind::Other) {
+                    any = true;
+                    if (ImGui::Selectable(entry.path.c_str()))
+                        chosen = entry.path;
+                    markItem("pick/" + entry.path);
+                }
+            if (!any && kind != "texture" && kind != "sound")
+                ImGui::TextDisabled("No %s assets in this project.", kind.c_str());
+        }
+        if (chosen && view.inspect.doc) {
+            writeOnce(view, AssetRef{*chosen});
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+}
+
+void drawProperty(const PropertyView &view, const Component &component) {
+    const PropertyInfo &property = view.property;
+    EditorDocument *doc = view.inspect.doc;
+    const PropertyValue value = property.get(component);
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    const std::string id = "prop/" + property.name;
+    switch (property.type) {
+    case PropertyType::Bool: {
+        bool current = std::get<bool>(value);
+        const bool changed = ImGui::Checkbox("##v", &current);
+        markItem(id);
+        if (doc)
+            commitEdit(*doc, view.changeLabel, changed, [&] { write(view, current); });
+        break;
+    }
+    case PropertyType::Int: {
+        int current = static_cast<int>(std::get<std::int64_t>(value));
+        const float low = property.hasRange ? static_cast<float>(property.minValue) : 0.0F;
+        const float high = property.hasRange ? static_cast<float>(property.maxValue) : 0.0F;
+        const bool changed =
+            ImGui::DragInt("##v", &current, 0.25F, static_cast<int>(low), static_cast<int>(high));
+        markItem(id);
+        if (doc)
+            commitEdit(*doc, view.changeLabel, changed,
+                       [&] { write(view, static_cast<std::int64_t>(current)); });
+        break;
+    }
+    case PropertyType::Float: {
+        float current = static_cast<float>(std::get<double>(value));
+        float speed = property.step > 0.0 ? static_cast<float>(property.step) : 0.02F;
+        if (property.step <= 0.0 && property.hasRange)
+            speed = std::clamp(static_cast<float>(property.maxValue - property.minValue) / 400.0F,
+                               0.005F, 0.25F);
+        const float low = property.hasRange ? static_cast<float>(property.minValue) : 0.0F;
+        const float high = property.hasRange ? static_cast<float>(property.maxValue) : 0.0F;
+        const bool changed = ImGui::DragFloat("##v", &current, speed, low, high, "%.3f",
+                                              property.hasRange ? ImGuiSliderFlags_AlwaysClamp : 0);
+        markItem(id);
+        if (doc)
+            commitEdit(*doc, view.changeLabel, changed,
+                       [&] { write(view, static_cast<double>(current)); });
+        break;
+    }
+    case PropertyType::String: {
+        std::string current = std::get<std::string>(value);
+        if (property.isLayer && view.inspect.state.project) {
+            const LayerConfig &layers = view.inspect.state.project->project().layers;
+            const bool known = layers.indexOf(current) >= 0;
+            if (!known)
+                ImGui::PushStyleColor(ImGuiCol_Text, imColor(palette::error));
+            const bool open =
+                ImGui::BeginCombo("##v", current.empty() ? "(none)" : current.c_str());
+            if (!known)
+                ImGui::PopStyleColor();
+            markItem(id);
+            if (open) {
+                for (const std::string &name : layers.names)
+                    if (ImGui::Selectable(name.c_str(), name == current) && doc)
+                        writeOnce(view, name);
+                ImGui::EndCombo();
+            }
+            if (!known)
+                tooltip("This layer is not defined in the project; layer 0 is used instead.");
+            break;
+        }
+        bool changed;
+        if (property.multiline)
+            changed =
+                inputTextMultiline("##v", current, {-FLT_MIN, ImGui::GetTextLineHeight() * 4.5F});
+        else
+            changed = inputText("##v", current);
+        markItem(id);
+        if (doc)
+            commitEdit(*doc, view.changeLabel, changed, [&] { write(view, current); });
+        break;
+    }
+    case PropertyType::Vec2: {
+        Vec2 current = std::get<Vec2>(value);
+        float speed = property.step > 0.0 ? static_cast<float>(property.step) : 0.02F;
+        if (property.isSize || property.isDisplacement || property.isOffset || property.isPin)
+            speed = 0.05F;
+        const float low = property.hasRange ? static_cast<float>(property.minValue) : 0.0F;
+        const float high = property.hasRange ? static_cast<float>(property.maxValue) : 0.0F;
+        const bool changed =
+            ImGui::DragFloat2("##v", &current.x, speed, low, high, "%.3f",
+                              property.hasRange ? ImGuiSliderFlags_AlwaysClamp : 0);
+        markPair(id);
+        if (doc)
+            commitEdit(*doc, view.changeLabel, changed, [&] { write(view, current); });
+        break;
+    }
+    case PropertyType::Color: {
+        const Color current = std::get<Color>(value);
+        float channels[4] = {
+            static_cast<float>(current.r) / 255.0F, static_cast<float>(current.g) / 255.0F,
+            static_cast<float>(current.b) / 255.0F, static_cast<float>(current.a) / 255.0F};
+        const bool changed = ImGui::ColorEdit4(
+            "##v", channels,
+            ImGuiColorEditFlags_Uint8 | ImGuiColorEditFlags_DisplayHex |
+                ImGuiColorEditFlags_AlphaBar | ImGuiColorEditFlags_AlphaPreviewHalf);
+        markItem(id);
+        if (doc)
+            commitEdit(*doc, view.changeLabel, changed, [&] {
+                write(view, fromImColor({channels[0], channels[1], channels[2], channels[3]}));
+            });
+        break;
+    }
+    case PropertyType::Enum: {
+        const auto current = static_cast<std::size_t>(std::get<std::int64_t>(value));
+        const char *shown =
+            current < property.options.size() ? property.options[current].c_str() : "?";
+        const bool open = ImGui::BeginCombo("##v", shown);
+        markItem(id);
+        if (open) {
+            for (std::size_t i = 0; i < property.options.size(); ++i) {
+                const bool picked = ImGui::Selectable(property.options[i].c_str(), i == current);
+                markItem(id + "/" + property.options[i]);
+                if (picked && doc)
+                    writeOnce(view, static_cast<std::int64_t>(i));
+            }
+            ImGui::EndCombo();
+        }
+        break;
+    }
+    case PropertyType::EntityReference:
+        entityField(view, std::get<EntityId>(value));
+        break;
+    case PropertyType::EntityReferenceList:
+        entityListField(view, std::get<std::vector<EntityId>>(value));
+        break;
+    case PropertyType::StringList:
+        stringListField(view, std::get<std::vector<std::string>>(value));
+        break;
+    case PropertyType::Asset:
+        assetField(view, std::get<AssetRef>(value));
+        break;
+    case PropertyType::Json: {
+        // Structured data is edited by the component's own tool; the Inspector says how much there
+        // is.
+        const Json &data = std::get<Json>(value);
+        const std::size_t bytes = data.isNull() ? 0 : data.dump().size();
+        ImGui::TextColored(imColor(vs::textDim), "%s",
+                           bytes == 0 ? "empty"
+                                      : (std::to_string(bytes) + " bytes of data").c_str());
+        markItem(id);
+        tooltip("Structured data. It is saved with the scene and edited with this component's own "
+                "tool.");
+        break;
+    }
+    }
+}
+
+void drawComponent(Inspect &inspect, std::size_t index, std::optional<std::size_t> &removeRequest) {
+    const Entity *entity = inspect.scene.find(inspect.entity);
+    const Component &component = *entity->components()[index];
+    const ComponentType &type = component.type();
+    ImGui::PushID(static_cast<int>(index));
+    ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_Framed |
+                               ImGuiTreeNodeFlags_AllowOverlap | ImGuiTreeNodeFlags_SpanAvailWidth;
+    const bool open = ImGui::CollapsingHeader((type.name + "###component").c_str(), flags);
+    markItem("component/" + type.name);
+    tooltip(type.description);
+    const float scrollbar = ImGui::GetScrollMaxY() > 0.0F ? ImGui::GetStyle().ScrollbarSize : 0.0F;
+    ImGui::SameLine(ImGui::GetWindowWidth() - ImGui::GetStyle().WindowPadding.x - scrollbar -
+                    58.0F);
+    bool enabled = component.enabled;
+    if (ImGui::Checkbox("##enabled", &enabled) && inspect.doc) {
+        const EntityId id = inspect.entity;
+        inspect.doc->change("Toggle " + type.name, [&](Scene &scene) {
+            scene.find(id)->components()[index]->enabled = enabled;
+        });
+    }
+    tooltip("Enable or disable this component.");
+    ImGui::SameLine();
+    if (ImGui::SmallButton("...") && inspect.doc)
+        ImGui::OpenPopup("component_menu");
+    markItem("component/" + type.name + "/menu");
+    if (ImGui::BeginPopup("component_menu")) {
+        const std::string blocker = entity->removalBlocker(component);
+        if (ImGui::MenuItem("Remove Component", nullptr, false, blocker.empty()))
+            removeRequest = index;
+        markItem("component/" + type.name + "/remove");
+        if (!blocker.empty())
+            tooltip("'" + blocker + "' needs this component.");
+        if (ImGui::MenuItem("Reset to Defaults") && inspect.doc) {
+            const EntityId id = inspect.entity;
+            inspect.doc->change("Reset " + type.name, [&](Scene &scene) {
+                Component &target = *scene.find(id)->components()[index];
+                for (const PropertyInfo &property : target.type().properties)
+                    if (!property.readOnly)
+                        property.assign(target, property.defaultValue);
+            });
+        }
+        ImGui::EndPopup();
+    }
+    if (open) {
+        ImGui::Spacing();
+        if (ImGui::BeginTable("##props", 2,
+                              ImGuiTableFlags_NoSavedSettings |
+                                  ImGuiTableFlags_SizingStretchProp)) {
+            ImGui::TableSetupColumn("name", ImGuiTableColumnFlags_WidthStretch, 0.46F);
+            ImGui::TableSetupColumn("value", ImGuiTableColumnFlags_WidthStretch, 0.54F);
+            for (const PropertyInfo &property : type.properties) {
+                if (property.hidden)
+                    continue;
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                ImGui::AlignTextToFramePadding();
+                nameCell(label(property.name), property.tooltip);
+                ImGui::TableSetColumnIndex(1);
+                ImGui::PushID(property.name.c_str());
+                const PropertyView view{inspect, index, property, "Edit " + label(property.name)};
+                if (property.readOnly)
+                    ImGui::BeginDisabled();
+                drawProperty(view, component);
+                if (property.readOnly)
+                    ImGui::EndDisabled();
+                ImGui::PopID();
+            }
+            ImGui::EndTable();
+        }
+        ImGui::Spacing();
+    }
+    ImGui::PopID();
+}
+
+void drawHeader(Inspect &inspect, const Entity &entity) {
+    EditorDocument *doc = inspect.doc;
+    bool active = entity.active();
+    if (ImGui::Checkbox("##active", &active) && doc)
+        doc->setEntityActive(inspect.entity, active);
+    markItem("inspector/active");
+    tooltip("An inactive entity and everything below it is ignored by the game.");
+    ImGui::SameLine();
+    std::string name = entity.name();
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    const bool changed = inputText("##name", name);
+    markItem("inspector/name");
+    if (doc)
+        commitEdit(*doc, "Rename", changed, [&] {
+            if (Entity *target = doc->edit().find(inspect.entity))
+                target->setName(name);
+        });
+
+    // Tags, edited as a comma separated list.
+    std::string tags;
+    for (const std::string &tag : entity.tags())
+        tags += (tags.empty() ? "" : ", ") + tag;
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    const bool tagsChanged = inputText("##tags", tags, 0, "Tags (comma separated)");
+    markItem("inspector/tags");
+    tooltip("Tags let hazards, plates and exits tell entities apart, e.g. enemy, collectible.");
+    if (doc)
+        commitEdit(*doc, "Edit Tags", tagsChanged, [&] {
+            std::vector<std::string> parsed;
+            std::string current;
+            const auto flush = [&] {
+                const auto first = current.find_first_not_of(" \t");
+                const auto last = current.find_last_not_of(" \t");
+                if (first != std::string::npos)
+                    parsed.push_back(current.substr(first, last - first + 1));
+                current.clear();
+            };
+            for (const char c : tags) {
+                if (c == ',')
+                    flush();
+                else
+                    current += c;
+            }
+            flush();
+            if (Entity *target = doc->edit().find(inspect.entity))
+                target->setTags(parsed);
+        });
+}
+
+// For an entity that belongs to a prefab instance: where it came from and the buttons that act on
+// the instance.
+void drawPrefabBar(Inspect &inspect, const Entity &entity) {
+    if (!inspect.doc)
+        return;
+    const EntityId root = inspect.doc->prefabRootOf(inspect.entity);
+    if (!root)
+        return;
+    const Entity &instance = *inspect.scene.find(root);
+    const std::string source = instance.prefabSource();
+    ImGui::Spacing();
+    const ImVec2 at = ImGui::GetCursorScreenPos();
+    ImDrawList &list = *ImGui::GetWindowDrawList();
+    drawIcon(list, Icon::Prefab, {at.x + 9.0F, at.y + 10.0F}, 16.0F,
+             packed(Color{110, 210, 150, 255}));
+    ImGui::SetCursorScreenPos({at.x + 22.0F, at.y});
+    ImGui::AlignTextToFramePadding();
+    if (root == inspect.entity) {
+        ImGui::TextColored(imColor(vs::textDim), "Prefab");
+        ImGui::SameLine();
+        if (ImGui::SmallButton(std::filesystem::path(source).filename().string().c_str()))
+            inspect.state.showAssetInExplorer(source);
+        markItem("inspector/prefab/source");
+        tooltip(source + "\nClick to show it in the Explorer.");
+        ImGui::SetCursorScreenPos({at.x, at.y + ImGui::GetFrameHeight() + 4.0F});
+        if (ImGui::Button("Revert"))
+            inspect.state.revertPrefab(inspect.entity);
+        markItem("inspector/prefab/revert");
+        tooltip("Put this instance back to what the prefab file says (name and position stay).");
+        ImGui::SameLine();
+        if (ImGui::Button("Apply"))
+            inspect.state.applyPrefab(inspect.entity);
+        markItem("inspector/prefab/apply");
+        tooltip("Write this instance to the prefab file. The other instances keep their contents "
+                "until you update them.");
+        ImGui::SameLine();
+        if (ImGui::Button("Update Others"))
+            inspect.state.updateOtherInstances(inspect.entity);
+        markItem("inspector/prefab/update");
+        tooltip("Put every other instance of this prefab in the open scenes back to the prefab "
+                "file's contents (asks first).");
+        ImGui::SameLine();
+        if (ImGui::Button("Unpack"))
+            inspect.state.unpackPrefab(inspect.entity);
+        markItem("inspector/prefab/unpack");
+        tooltip("Forget where this instance came from.");
+    } else {
+        ImGui::TextColored(imColor(vs::textDim), "Part of");
+        ImGui::SameLine();
+        if (ImGui::SmallButton(instance.name().c_str()))
+            inspect.doc->select(root);
+        markItem("inspector/prefab/root");
+        tooltip("Select the prefab instance this entity belongs to (" + source + ").");
+    }
+    (void)entity;
+}
+
+void drawTransform(Inspect &inspect, const Entity &entity) {
+    EditorDocument *doc = inspect.doc;
+    if (!ImGui::CollapsingHeader("Transform",
+                                 ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_Framed))
+        return;
+    markItem("component/Transform");
+    ImGui::Spacing();
+    if (!ImGui::BeginTable("##transform", 2,
+                           ImGuiTableFlags_NoSavedSettings | ImGuiTableFlags_SizingStretchProp))
+        return;
+    ImGui::TableSetupColumn("name", ImGuiTableColumnFlags_WidthStretch, 0.46F);
+    ImGui::TableSetupColumn("value", ImGuiTableColumnFlags_WidthStretch, 0.54F);
+    const auto row = [&](const char *name, const char *tip) {
+        ImGui::TableNextRow();
+        ImGui::TableSetColumnIndex(0);
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted(name);
+        tooltip(tip);
+        ImGui::TableSetColumnIndex(1);
+        ImGui::SetNextItemWidth(-FLT_MIN);
+    };
+    Transform2D transform = entity.transform();
+    const char *space = entity.parentId() ? "Relative to the parent entity."
+                                          : "World position, in meters (+Y is down).";
+    row("Position", space);
+    bool changed =
+        ImGui::DragFloat2("##position", &transform.position.x, 0.05F, 0.0F, 0.0F, "%.3f");
+    markPair("inspector/position");
+    if (doc)
+        commitEdit(*doc, "Edit Position", changed, [&] {
+            doc->edit().find(inspect.entity)->transform().position = transform.position;
+        });
+    row("Rotation", "Degrees, clockwise on screen.");
+    changed =
+        ImGui::DragFloat("##rotation", &transform.rotationDegrees, 0.5F, 0.0F, 0.0F, "%.2f deg");
+    markItem("inspector/rotation");
+    if (doc)
+        commitEdit(*doc, "Edit Rotation", changed, [&] {
+            doc->edit().find(inspect.entity)->transform().rotationDegrees =
+                transform.rotationDegrees;
+        });
+    row("Scale", "Multiplies sizes and offsets of this entity's components.");
+    changed = ImGui::DragFloat2("##scale", &transform.scale.x, 0.01F, 0.0F, 0.0F, "%.3f");
+    markPair("inspector/scale");
+    if (doc)
+        commitEdit(*doc, "Edit Scale", changed,
+                   [&] { doc->edit().find(inspect.entity)->transform().scale = transform.scale; });
+    ImGui::EndTable();
+    ImGui::Spacing();
+}
+
+void addComponentPopup(Inspect &inspect) {
+    if (!ImGui::BeginPopup("add_component"))
+        return;
+    static std::string filter;
+    if (ImGui::IsWindowAppearing()) {
+        filter.clear();
+        ImGui::SetKeyboardFocusHere();
+    }
+    inputText("##search", filter, 0, "Search components");
+    ImGui::Separator();
+    if (filter.empty()) {
+        addComponentMenu(inspect.state, inspect.entity);
+    } else {
+        const Entity *entity = inspect.scene.find(inspect.entity);
+        for (const auto &type : inspect.state.registry.types()) {
+            if (type->hiddenInMenus || !(containsInsensitive(type->name, filter) ||
+                                         containsInsensitive(type->category, filter)))
+                continue;
+            const bool present =
+                entity && entity->findComponent(type->name) && !type->allowMultiple;
+            if (ImGui::MenuItem((type->name + "  (" + type->category + ")").c_str(), nullptr, false,
+                                !present)) {
+                inspect.doc->addComponent(inspect.entity, type->name);
+                ImGui::CloseCurrentPopup();
+            }
+            markItem("add/" + type->name);
+            tooltip(type->description);
+        }
+    }
+    ImGui::EndPopup();
+}
+
+// The scene's own settings, shown when no entity is selected: name, gravity and background.
+void sceneInspector(EditorState &state, const Scene &scene) {
+    EditorDocument *doc = state.playing() ? nullptr : state.document.get();
+    const SceneSettings &settings = scene.settings;
+    ImGui::PushFont(fonts().semibold, 14.0F);
+    ImGui::TextUnformatted("Scene");
+    ImGui::PopFont();
+    if (!doc)
+        ImGui::TextColored(imColor(palette::good), "Running copy (read-only)");
+    ImGui::Spacing();
+    ImGui::BeginDisabled(!doc);
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted("Name");
+    ImGui::SameLine(96.0F);
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    std::string name = settings.name;
+    bool changed = inputText("##scenename", name);
+    markItem("scene/settings/name");
+    if (doc)
+        commitEdit(*doc, "Rename Scene", changed, [&] { doc->edit().settings.name = name; });
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted("Gravity");
+    ImGui::SameLine(96.0F);
+    float gravity[2] = {settings.gravity.x, settings.gravity.y};
+    const float half = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5F;
+    for (int axis = 0; axis < 2; ++axis) {
+        if (axis == 1)
+            ImGui::SameLine();
+        ImGui::PushID(axis);
+        ImGui::SetNextItemWidth(half);
+        changed = ImGui::DragFloat("##g", &gravity[axis], 0.05F, -200.0F, 200.0F, "%.2f");
+        markItem(axis == 0 ? "scene/settings/gravity/x" : "scene/settings/gravity/y");
+        tooltip("Meters per second squared; +Y points down.");
+        if (doc)
+            commitEdit(*doc, "Edit Gravity", changed,
+                       [&] { doc->edit().settings.gravity = {gravity[0], gravity[1]}; });
+        ImGui::PopID();
+    }
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted("Background");
+    ImGui::SameLine(96.0F);
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    ImVec4 color = imColor(settings.background);
+    changed = ImGui::ColorEdit4("##background", &color.x,
+                                ImGuiColorEditFlags_AlphaBar | ImGuiColorEditFlags_NoInputs);
+    markItem("scene/settings/background");
+    if (doc)
+        commitEdit(*doc, "Edit Background", changed,
+                   [&] { doc->edit().settings.background = fromImColor(color); });
+    ImGui::EndDisabled();
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+    std::size_t active = 0;
+    scene.forEach([&](const Entity &entity) { active += entity.activeInHierarchy() ? 1 : 0; });
+    ImGui::TextColored(imColor(vs::textDim), "%zu entities (%zu active), %zu at the top level",
+                       scene.size(), active, scene.roots().size());
+    const Camera *camera = SceneRenderer::primaryCamera(scene);
+    ImGui::TextColored(imColor(vs::textDim), camera
+                                                 ? "The game looks through a camera."
+                                                 : "There is no camera: the game shows nothing.");
+    ImGui::Spacing();
+    ImGui::TextDisabled("Select an entity to edit it.");
+}
+
+// True while the Inspector shows a file picked in the Explorer instead of an entity: from the pick
+// until the entity selection changes.
+bool assetInspected(EditorState &state) {
+    if (state.selectedAsset.empty() || !state.project || state.playing())
+        return false;
+    if (state.document) {
+        const auto &selection = state.document->selection();
+        if (selection.size() != state.assetSelectionMark.size() ||
+            !std::equal(selection.begin(), selection.end(), state.assetSelectionMark.begin())) {
+            state.selectedAsset.clear(); // An entity was selected since: back to the entities.
+            return false;
+        }
+    }
+    return true;
+}
+} // namespace
+
+void inspectorPanel(EditorState &state) {
+    const Scene *scene = state.visibleScene();
+    const EntityId id = state.inspected();
+    const Entity *entity = scene ? scene->find(id) : nullptr;
+    if (assetInspected(state)) {
+        assetInspector(state);
+        return;
+    }
+    if (!entity) {
+        if (scene)
+            sceneInspector(state, *scene);
+        else
+            ImGui::TextDisabled("Nothing to inspect.");
+        return;
+    }
+    EditorDocument *doc = state.playing() ? nullptr : state.document.get();
+    Inspect inspect{state, *scene, doc, id};
+    if (doc && doc->selection().size() > 1) {
+        ImGui::PushStyleColor(ImGuiCol_Text, imColor(palette::dim));
+        ImGui::TextWrapped(
+            "%zu selected. Component fields change all of them; name, tags and Transform only "
+            "the one shown.",
+            doc->selection().size());
+        ImGui::PopStyleColor();
+    }
+    if (!doc)
+        ImGui::TextColored(imColor(palette::good), "Running copy (read-only)");
+    ImGui::BeginDisabled(!doc);
+    drawHeader(inspect, *entity);
+    drawPrefabBar(inspect, *entity);
+    ImGui::Spacing();
+    drawTransform(inspect, *entity);
+    std::optional<std::size_t> removeRequest;
+    for (std::size_t i = 0; i < entity->components().size(); ++i)
+        drawComponent(inspect, i, removeRequest);
+    ImGui::Spacing();
+    if (ImGui::Button("Add Component", {-FLT_MIN, 28.0F}) && doc)
+        ImGui::OpenPopup("add_component");
+    markItem("inspector/add-component");
+    if (doc)
+        addComponentPopup(inspect);
+    ImGui::EndDisabled();
+    ImGui::TextDisabled("id %s", toString(id).c_str());
+    if (removeRequest && doc) {
+        if (auto removed = doc->removeComponent(id, *removeRequest); !removed)
+            log(LogLevel::Warning, "editor", removed.error());
+    }
+}
+} // namespace yk::editor::ui

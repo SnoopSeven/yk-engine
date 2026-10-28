@@ -1,0 +1,127 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 25,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "dev",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/dev",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "BUILD_TESTING": "ON",
+        "YK_BUILD_GAMES": "ON"
+      }
+    },
+    {
+      "name": "release",
+      "inherits": "dev",
+      "binaryDir": "${sourceDir}/build/release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
+      "name": "asan",
+      "inherits": "dev",
+      "binaryDir": "${sourceDir}/build/asan",
+      "cacheVariables": {
+        "YK_SANITIZERS": "ON"
+      }
+    },
+    {
+      "name": "headless",
+      "inherits": "dev",
+      "binaryDir": "${sourceDir}/build/headless",
+      "cacheVariables": {
+        "YK_RUNTIME": "OFF"
+      }
+    },
+    {
+      "name": "clang",
+      "inherits": "dev",
+      "binaryDir": "${sourceDir}/build/clang",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "clang",
+        "CMAKE_CXX_COMPILER": "clang++",
+        "CMAKE_CXX_FLAGS": "-stdlib=libc++"
+      }
+    },
+    {
+      "name": "windows-cross",
+      "inherits": "release",
+      "binaryDir": "${sourceDir}/build/windows-cross",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/mingw-w64-x86_64.cmake",
+      "cacheVariables": {
+        "BUILD_TESTING": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "dev",
+      "configurePreset": "dev"
+    },
+    {
+      "name": "release",
+      "configurePreset": "release"
+    },
+    {
+      "name": "asan",
+      "configurePreset": "asan"
+    },
+    {
+      "name": "headless",
+      "configurePreset": "headless"
+    },
+    {
+      "name": "clang",
+      "configurePreset": "clang"
+    },
+    {
+      "name": "windows-cross",
+      "configurePreset": "windows-cross"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "dev",
+      "configurePreset": "dev",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "release",
+      "configurePreset": "release",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "asan",
+      "configurePreset": "asan",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "headless",
+      "configurePreset": "headless",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "clang",
+      "configurePreset": "clang",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
+  ]
+}

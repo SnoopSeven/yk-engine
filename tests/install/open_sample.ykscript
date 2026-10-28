@@ -1,0 +1,13 @@
+# Installed editor opens an external project passed on the command line.
+expect project "Invisible Castle"
+expect project-root "${SAMPLE_DIR}"
+expect scene scenes/menu.ykscene
+expect entity "Play Button"
+
+key f5
+expect playing
+hold d 30
+key shift+f5
+expect editing
+expect clean
+log "installed editor opened and played the sample"

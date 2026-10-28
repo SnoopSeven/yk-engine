@@ -1,0 +1,11 @@
+/build/
+/engine/build/
+/.cache/
+/CMakeUserPresets.json
+.DS_Store
+.vscode/
+.idea/
+*.user
+/.deps/
+__pycache__/
+*.pyc

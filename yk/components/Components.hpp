@@ -1,0 +1,442 @@
+#pragma once
+#include "yk/animation/AnimationController.hpp"
+#include "yk/input/Input.hpp"
+#include "yk/scene/Entity.hpp"
+#include <array>
+#include <memory>
+#include <string>
+#include <string_view>
+#include <vector>
+
+// Standard components every game gets: rendering data, physics bodies and colliders, camera, UI,
+// audio and sprite animation. They are data plus (where needed) small runtime behaviour; drawing is
+// done by SceneRenderer and simulation by GameRuntime.
+namespace yk {
+// ----- Input -------------------------------------------------------------------------------
+// Says which set of the project's input map ("Player1", "Player2") controls this entity. Components
+// that respond to a person (the platformer controller, levers with an Interact action) read their
+// named actions through it, so two characters need two PlayerInput components and no code.
+class PlayerInput final : public Component {
+  public:
+    std::string actionSet{"Player1"};
+    static void describe(TypeBuilder<PlayerInput> &type);
+
+    // What the person is doing: nothing while this component is disabled, or while the game's
+    // input is locked (GameContext::lockInput: a level-complete sequence, a fade between scenes).
+    // Components that answer to a person read their actions through here, not from the raw input.
+    ButtonState button(const GameContext &context, std::string_view action) const;
+    float value(const GameContext &context, std::string_view action) const;
+    // value(positive) - value(negative), in -1..+1.
+    float axis(const GameContext &context, std::string_view negative,
+               std::string_view positive) const;
+};
+
+// ----- Rendering ---------------------------------------------------------------------------
+enum class SpriteShape { Rectangle, Ellipse };
+// Simple stretches the texture over `size`. Tiled repeats it (cropping the last row and column) so
+// a platform can be resized without distorting its art. Sliced keeps the corners of a nine-slice
+// texture (its .ykmeta `border`) at their natural size and fills the edges and the middle.
+enum class SpriteDrawMode { Simple, Tiled, Sliced };
+enum class SpriteFill { Stretch, Tile }; // How a Sliced sprite fills its edges and middle.
+enum class SpriteBlend { Alpha, Additive };
+
+// Draws a texture, or a colored placeholder shape while no art exists. Swapping in final art is
+// assigning `texture`; nothing else in the game depends on how a sprite looks.
+class SpriteRenderer final : public Component {
+  public:
+    AssetRef texture; // Empty: draw `shape` in `color`.
+    SpriteShape shape{SpriteShape::Rectangle};
+    Vec2 size{1.0F, 1.0F}; // World units.
+    Vec2 offset{0.0F, 0.0F};
+    Color color{255, 255, 255, 255};
+    int layer{0};
+    float order{0.0F};
+    bool ySort{false};      // Within a layer, lower feet draw in front of higher feet.
+    float sortOffset{0.0F}; // Adjust the ground contact point without moving the artwork.
+    bool flipX{false};
+    bool visible{true};
+    int columns{
+        1}; // Sprite sheet grid; `frame` selects the cell. 1 x 1 defers to the texture's meta.
+    int rows{1};
+    int frame{0};
+    SpriteDrawMode drawMode{SpriteDrawMode::Simple};
+    Vec2 tileSize{0.0F, 0.0F}; // Tiled: world size of one repeat; 0 uses the texture's own size.
+    SpriteFill sliceFill{SpriteFill::Tile};
+    SpriteBlend blend{SpriteBlend::Alpha};
+    // 1 moves with the world; 0 stays fixed on screen (far background); in between scrolls slower
+    // than the camera. Applied by the game view, not by the editor's scene view.
+    Vec2 parallax{1.0F, 1.0F};
+    // Optional soft contact shadow, anchored to the entity's feet rather than its animated art.
+    Vec2 shadowSize{};
+    Vec2 shadowOffset{0.06F, 0.04F};
+    Color shadowColor{8, 12, 24, 150};
+    // Runtime pose for a single-pose character: legs step independently below the torso.
+    // Not serialized; CharacterMotion supplies it from body velocity.
+    float stepSwing{};
+    static void describe(TypeBuilder<SpriteRenderer> &type);
+};
+
+enum class UiAnchor {
+    TopLeft,
+    Top,
+    TopRight,
+    Left,
+    Center,
+    Right,
+    BottomLeft,
+    Bottom,
+    BottomRight
+};
+const std::vector<std::string> &uiAnchorNames();
+Vec2 uiTopLeft(UiAnchor anchor, Vec2 viewport, Vec2 size, Vec2 offset);
+
+// Screen-space text. `text` may contain {variable} placeholders resolved from the Blackboard.
+class UiText final : public Component {
+  public:
+    std::string text{"Text"};
+    UiAnchor anchor{UiAnchor::TopLeft};
+    Vec2 offset{16.0F, 16.0F}; // Pixels from the anchor point, toward the screen center.
+    float scale{2.0F};         // Font pixel multiplier.
+    Color color{255, 255, 255, 255};
+    bool shadow{true};
+    int layer{0};
+    static void describe(TypeBuilder<UiText> &type);
+};
+
+// Screen-space textured rectangle (HUD icons, frames, logos). A sprite sheet cell can be picked
+// with columns/rows/frame, like SpriteRenderer.
+class UiImage final : public Component {
+  public:
+    AssetRef texture; // Empty draws a solid rectangle in `color`.
+    UiAnchor anchor{UiAnchor::TopLeft};
+    Vec2 size{48.0F, 48.0F}; // Pixels.
+    Vec2 offset{16.0F, 16.0F};
+    Color color{255, 255, 255, 255};
+    int layer{0};
+    int columns{1};
+    int rows{1};
+    int frame{0};
+    bool fillScreen{false}; // Stretch over the whole viewport (size, anchor and offset unused).
+    static void describe(TypeBuilder<UiImage> &type);
+};
+
+// Screen-space filled rectangle (HUD backgrounds, overlays).
+class UiPanel final : public Component {
+  public:
+    UiAnchor anchor{UiAnchor::TopLeft};
+    Vec2 size{200.0F, 48.0F}; // Pixels.
+    Vec2 offset{8.0F, 8.0F};
+    Color color{0, 0, 0, 140};
+    int layer{-1};
+    static void describe(TypeBuilder<UiPanel> &type);
+};
+
+// Adds hover feedback and release-to-click navigation to a screen-space panel.
+class UiButton final : public Component {
+  public:
+    std::string changeScene;
+    Color hoverColor{49, 91, 112, 255};
+    Color pressedColor{28, 63, 83, 255};
+    static void describe(TypeBuilder<UiButton> &type);
+    void onFixedUpdate(GameContext &context, float seconds) override;
+    bool hovered() const {
+        return hovered_;
+    }
+    bool pressed() const {
+        return armed_;
+    }
+
+  private:
+    bool hovered_{};
+    bool armed_{};
+};
+
+// Optional in-game pause controls. GameSession handles input while simulation is stopped.
+class PauseMenu final : public Component {
+  public:
+    bool allowPause{true};
+    std::string menuScene;
+    std::string levelSelectScene;
+    std::string title{"PAUSED"};
+    int selected{};
+    int armed{-1};
+    Vec2 pointerPosition{-1, -1};
+    static void describe(TypeBuilder<PauseMenu> &type);
+    static Rect buttonRect(Vec2 viewport, int row);
+};
+
+// A conversation belongs to an entity but is presented in screen space by SceneRenderer.
+// Pages may be authored inline or loaded from a dialogue JSON asset. The runtime owns playback;
+// the renderer only reads the current page, so any interactive entity can reuse it.
+struct DialoguePage {
+    std::string speaker;
+    std::string text;
+    AssetRef portrait;
+    std::string side{"left"}; // Which side the portrait is on: "left" or "right".
+    std::string expression;
+};
+class DialogueSession;
+class Dialogue final : public Component {
+  public:
+    AssetRef sequence;
+    std::string speaker;
+    std::vector<std::string> pages;
+    AssetRef portrait;
+    std::string advanceSet{"Player1"};
+    std::string advanceAction{"Interact"};
+    std::string upAction{"MoveUp"};     // Moves the choice up (graph conversations).
+    std::string downAction{"MoveDown"}; // And down; the advance action picks.
+    float charactersPerSecond{45.0F};   // Zero shows the whole page immediately.
+    bool lockInput{true};               // Movement and actions stop while the conversation is open.
+    static void describe(TypeBuilder<Dialogue> &type);
+    // Starts the conversation. `actor` is who is talking to it (what rules in the dialogue call the
+    // actor); a graph file (.ykdialogue with "nodes") is walked, a list of pages is shown in turn.
+    void begin(GameContext &context, EntityId actor = {});
+    void close(GameContext &context);
+    bool active() const {
+        return active_;
+    }
+    const DialoguePage &currentPage() const {
+        return session_ ? graphPage_ : loaded_[page_];
+    }
+    std::string visibleText() const;
+    // The choices on offer once the text has been shown (empty for pages and for nodes without
+    // choices), and which one is selected.
+    const std::vector<std::string> &choices() const {
+        return choices_;
+    }
+    int selectedChoice() const {
+        return selected_;
+    }
+    bool choosing() const;
+    float presentationTime() const {
+        return presentationTime_;
+    }
+    void onFixedUpdate(GameContext &context, float seconds) override;
+    void onDestroy(GameContext &context) override;
+
+  private:
+    void end(GameContext &context);
+    void showNode(GameContext &context);
+    std::shared_ptr<DialogueSession> session_;
+    DialoguePage graphPage_;
+    std::vector<std::string> choices_;
+    int selected_{0};
+    EntityId actor_{};
+    std::string source_; // The asset the conversation was read from.
+    std::vector<DialoguePage> loaded_;
+    std::size_t page_{};
+    float visibleCharacters_{};
+    std::uint64_t startedTick_{};
+    bool active_{};
+    float presentationTime_{};
+};
+
+// ----- Physics -----------------------------------------------------------------------------
+enum class RigidBodyType { Static, Kinematic, Dynamic };
+
+// Gives an entity a physics body. Colliders on this entity and on its descendants become the body's
+// shapes. A collider with no RigidBody in its hierarchy is treated as static geometry.
+class RigidBody final : public Component {
+  public:
+    RigidBodyType type{RigidBodyType::Dynamic};
+    float gravityScale{1.0F};
+    float linearDamping{0.0F};
+    float angularDamping{0.05F};
+    bool fixedRotation{false};
+    bool bullet{false};
+    bool allowSleep{true};
+    static void describe(TypeBuilder<RigidBody> &type);
+};
+
+// A Wedge is a right triangle filling its size box, with the right angle at the bottom right, so it
+// rises to the right: a ramp. Mirror the entity (scale x = -1) for a ramp that rises to the left,
+// or scale y = -1 for a sloped ceiling. Its sprite mirrors the same way.
+enum class ColliderShape { Box, Circle, Capsule, Wedge };
+
+// The three corners of a wedge of `halfExtents` in the collider's own frame (before rotation),
+// mirrored by the signs of `scaleSign`. Shared by physics and the editor's outline drawing.
+std::array<Vec2, 3> wedgePoints(Vec2 halfExtents, Vec2 scaleSign);
+
+// Collision or trigger geometry. `size` is the full extent in world units (before entity scale);
+// circles use the width as diameter; capsules are vertical with rounded ends.
+class Collider final : public Component {
+  public:
+    ColliderShape shape{ColliderShape::Box};
+    Vec2 size{1.0F, 1.0F};
+    Vec2 offset{0.0F, 0.0F};
+    bool isTrigger{false}; // Overlap events only, no physical response.
+    // A jump-through platform: it blocks only what comes down onto its top side; things below or
+    // beside it, or moving up through it, pass. Not for triggers.
+    bool oneWay{false};
+    bool detectTriggers{false};   // A trigger normally ignores other triggers.
+    std::string layer{"Default"}; // Project collision layer name.
+    float friction{0.6F};
+    float restitution{0.0F};
+    float density{1.0F};
+    // Rounds the corners of a Box (world units, before entity scale). A low step or the edge of a
+    // button that is rounded lets a character run up onto it instead of catching on the corner.
+    float cornerRadius{0.0F};
+    // Cuts the corners of a Box: how far along each side the cut starts, x along the top and
+    // bottom, y along the left and right (world units, before entity scale). A shallow slope
+    // (wide x, small y) lets things slide up onto the box: a character walks onto a button, a
+    // crate is pushed onto it. A Box with a chamfer is an octagon and ignores cornerRadius.
+    Vec2 chamfer{0.0F, 0.0F};
+    static void describe(TypeBuilder<Collider> &type);
+};
+
+// Pins the entity's body to a point so that it swings or tilts about it: a seesaw, a drawbridge, a
+// swinging platform, a door on a hinge that a character can push. The pin is `anchor`, a point in
+// this entity's own space. `connectedBody` names another entity with a body that the pin is fixed
+// to (a plank on a fulcrum: the plank's hinge names the fulcrum); left empty, the pin is fixed in
+// the world. Angles are measured from the pose the scene has at the start, positive clockwise on
+// screen. Needs a Dynamic RigidBody: the physics moves it, it stands or lies on nothing else.
+class HingeJoint final : public Component {
+  public:
+    EntityRef connectedBody;
+    Vec2 anchor{0.0F, 0.0F};
+    bool limits{false}; // Keep the swing between lowerAngle and upperAngle.
+    float lowerAngle{-45.0F};
+    float upperAngle{45.0F};
+    bool spring{false}; // Pull toward restAngle (a lever that returns, a bridge that rises).
+    float springHertz{2.0F};
+    float springDamping{0.5F};
+    float restAngle{0.0F};
+    bool motor{false}; // Turn at motorSpeed as long as the torque allows.
+    float motorSpeed{90.0F};
+    float motorTorque{20.0F};
+    bool collideConnected{false}; // Let the two bodies touch each other.
+    static void describe(TypeBuilder<HingeJoint> &type);
+};
+
+// ----- Camera ------------------------------------------------------------------------------
+enum class CameraMode { Fixed, Follow, FitTargets };
+
+struct CameraView {
+    Vec2 position;
+    float visibleHeight{}; // World units visible vertically; width follows the viewport's aspect.
+};
+
+class Camera final : public Component {
+  public:
+    bool primary{true};
+    CameraMode mode{CameraMode::Fixed};
+    float orthographicHeight{18.0F};
+    // Zero draws at display resolution; positive values rasterize the world on this pixel grid.
+    float pixelsPerUnit{0.0F};
+    Vec2 viewportInset{}; // Reserved screen pixels at 1280 x 720; scales with the viewport.
+    std::vector<EntityRef> targets; // Follow: their midpoint. FitTargets: also zoom to contain all.
+    float padding{3.0F};            // Margin around fitted targets, world units.
+    float smoothTime{0.15F};        // Seconds to close about 63% of the distance; 0 snaps.
+    float minHeight{8.0F};
+    float maxHeight{60.0F};
+    bool clampToBounds{false};
+    Vec2 boundsMin{0.0F, 0.0F};
+    Vec2 boundsMax{32.0F, 18.0F};
+    static void describe(TypeBuilder<Camera> &type);
+
+    // Where this camera looks: the smoothed runtime state once the game is running, the authored
+    // position and height before that.
+    CameraView view() const;
+    // The same, `alpha` (0..1) of the way from the previous tick's view to the current one, for
+    // drawing at a display rate above the simulation's.
+    CameraView viewAt(float alpha) const;
+    // The world level the camera is looking at: that of its first target that is in the scene, else
+    // the first level. The game view uses it to show the right floor.
+    int focusLevel() const;
+    // Follows once per fixed tick, after the tick's physics and after everything it follows has
+    // moved (the PostSimulation phase), not once per drawn frame.
+    void onFixedUpdate(GameContext &context, float seconds) override;
+
+    // A cutscene or a script can take the camera: while it is held it looks at `center` (with the
+    // given visible height, 0 for its own) instead of its targets, smoothed as usual. `cut` jumps
+    // there on the next tick instead of gliding.
+    void hold(Vec2 center, float visibleHeight = 0.0F, bool cut = false) {
+        held_ = true;
+        heldCenter_ = center;
+        heldHeight_ = visibleHeight;
+        cut_ = cut_ || cut;
+    }
+    void release() {
+        held_ = false;
+    }
+    bool held() const {
+        return held_;
+    }
+
+  private:
+    bool held_{};
+    bool cut_{};
+    Vec2 heldCenter_{};
+    float heldHeight_{};
+    Vec2 position_{};
+    float height_{};
+    Vec2 previousPosition_{};
+    float previousHeight_{};
+    bool initialized_{};
+};
+
+// ----- Audio -------------------------------------------------------------------------------
+class AudioSource final : public Component {
+  public:
+    AssetRef sound;
+    float volume{1.0F};
+    bool loop{false};
+    bool playOnStart{false};
+    static void describe(TypeBuilder<AudioSource> &type);
+    void play(GameContext &context) const;
+    void onStart(GameContext &context) override;
+};
+
+// ----- Animation ---------------------------------------------------------------------------
+// Animates the entity's SpriteRenderer from a ".ykanim" asset (clips over a sprite sheet), either
+// by playing a clip or by running a ".ykctl" state machine over generic parameters. Gameplay never
+// names a clip: components such as PlatformerController and Killable publish parameters (speed,
+// grounded, a "jumped" trigger, dead...) and the controller asset decides what plays.
+class AnimatedSprite final : public Component {
+  public:
+    AssetRef animation;  // Clips, sheet layout and texture.
+    AssetRef controller; // Optional state machine over the clips.
+    std::string clip;    // Without a controller: the clip to play (the first when empty).
+    float speed{1.0F};   // Playback speed multiplier for everything.
+    bool playOnStart{true};
+    // The sprite is mirrored when this parameter is negative ("facing" is published by the
+    // platformer controller); empty never flips. Set artFacesLeft when the art is drawn facing
+    // left.
+    std::string flipParameter{"facing"};
+    bool artFacesLeft{false};
+    static void describe(TypeBuilder<AnimatedSprite> &type);
+
+    // Controller parameters. Names the controller does not declare are ignored.
+    void setFloat(const std::string &name, double value) {
+        player_.setFloat(name, value);
+    }
+    void setBool(const std::string &name, bool value) {
+        player_.setBool(name, value);
+    }
+    void trigger(const std::string &name) {
+        player_.trigger(name);
+    }
+    double value(const std::string &name) const {
+        return player_.value(name);
+    }
+    // Plays a clip directly (ignored when it does not exist); starts playback if it was off.
+    void play(const std::string &name);
+    const AnimationPlayer &player() const {
+        return player_;
+    }
+    // Current state of the controller (or the clip when there is none).
+    const std::string &state() const {
+        return player_.state();
+    }
+    void onStart(GameContext &context) override;
+    void onUpdate(GameContext &context, float seconds) override;
+
+  private:
+    AnimationPlayer player_;
+    bool playing_{};
+};
+
+class ComponentRegistry;
+void registerEngineComponents(ComponentRegistry &registry);
+} // namespace yk
